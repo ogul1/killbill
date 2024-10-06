@@ -1,0 +1,213 @@
+#cache: 'maven'
+# Go to Sonatype directly to avoid delay syncs (could get rid of this if actions/setup-java were to support mirrors).
+# Required for caching
+# https://github.com/killbill/killbill-integration-tests/issues/43
+# TODO add missing creds
+# - name: Run plugins tests
+#   env:
+#     DB_ADAPTER: ${{ matrix.database-adapter }}
+#     DB_USER: ${{ matrix.database-user }}
+#     DB_PASSWORD: ${{ matrix.database-password }}
+#     DB_PORT: ${{ matrix.database-port }}
+#   working-directory: ${{github.workspace}}/killbill-integration-tests
+#   run: |
+#     bundle exec rake test:plugins TESTOPTS="--stop-on-failure"
+
+name: Modified ci
+jobs:
+  ci:
+    uses: killbill/gh-actions-shared/.github/workflows/ci.yml@main
+  e2e:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+        - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s
+          --health-retries=10
+    strategy:
+      matrix:
+        include:
+        - ruby-version: 2.5.0
+          ref: refs/heads/master
+          database-adapter: mysql2
+          database-user: root
+          database-password: root
+          database-port: '3306'
+          database: mysql
+          java-version: '11'
+          java-distribution: temurin
+          maven_version: 3.8.4
+    steps:
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install dependencies
+      run: |-
+        python -m pip install --upgrade pip
+        pip install inotify
+    - name: Run inotifywait
+      run: |-
+        python3 -c "
+        import inotify.adapters
+        import inotify.constants
+        import os
+        from datetime import datetime, timezone
+        with open('/home/runner/inotifywait-log-e2e ().csv', 'w') as log_file:
+          i = inotify.adapters.InotifyTree('/home/runner/work/killbill/killbill', inotify.constants.IN_CREATE | inotify.constants.IN_ACCESS)
+          for event in i.event_gen(yield_nones=False):
+            (_, type_names, path, filename) = event
+            now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f') + 'Z'
+            events = ','.join(type_names)
+            log_file.write(f'{now};{path};{filename};{events}\n')
+            log_file.flush()
+            os.fsync(log_file.fileno())
+        " &
+    - name: Checkout killbill
+      uses: actions/checkout@v2.4.0
+      with:
+        persist-credentials: false
+    - run: touch optcd-3.txt
+    - name: Set up JDK
+      uses: actions/setup-java@v2.5.0
+      with:
+        java-version: ${{ matrix.java-version }}
+        distribution: ${{ matrix.java-distribution }}
+    - run: touch optcd-4.txt
+    - name: Configure Sonatype mirror
+      uses: s4u/maven-settings-action@v2.4.1
+      with:
+        mirrors: '[{"id": "oss-releases", "name": "Sonatype releases", "mirrorOf":
+          "central", "url": "https://oss.sonatype.org/content/repositories/releases"}]'
+        sonatypeSnapshots: true
+    - run: touch optcd-5.txt
+    - name: Set up Maven
+      run: mvn --errors --batch-mode --show-version wrapper:wrapper "-Dmaven=${{ matrix.maven_version
+        }}"
+    - run: touch optcd-6.txt
+    - name: Build Kill Bill
+      run: ./mvnw --errors --batch-mode --show-version clean install -DskipTests=true
+        -Dcheck.skip-dependency=true -Dcheck.skip-dependency-scope=true -Dcheck.skip-dependency-versions=true
+        -Dcheck.skip-duplicate-finder=true -Dcheck.skip-enforcer=true -Dcheck.skip-rat=true
+        -Dcheck.skip-spotbugs=true
+    - run: touch optcd-7.txt
+    - name: Wait for MySQL
+      run: |-
+        set +e
+        count=0
+        until mysqladmin ping -h 127.0.0.1 -u root --password=root --silent; do
+          if [[ "$count" == "25" ]]; then
+            exit 1
+          fi
+          (( count++ ))
+          printf '.'
+          sleep 5
+        done
+        set -e
+    - run: touch optcd-8.txt
+    - name: Wait for PostgreSQL
+      run: |-
+        set +e
+        count=0
+        until $(psql -h 127.0.0.1 -U postgres -p 5432 -l > /dev/null); do
+          if [[ "$count" == "25" ]]; then
+            exit 1
+          fi
+          (( count++ ))
+          printf '.'
+          sleep 5
+        done
+        set -e
+    - run: touch optcd-9.txt
+    - name: Setup latest DDL
+      run: |-
+        mysql -h 127.0.0.1 -u root --password=root -e 'create database killbill'
+        ./bin/db-helper -a create --driver mysql -u root -p root -t yes -h 127.0.0.1
+    - run: touch optcd-10.txt
+    - name: Setup latest DDL
+      run: |-
+        psql -h 127.0.0.1 -U postgres -p 5432 -c 'create database killbill'
+        ./bin/db-helper -a create --driver postgres -u postgres -t yes -h 127.0.0.1 --port 5432
+    - run: touch optcd-11.txt
+    - name: Install plugin specific MySQL DDL
+      run: |-
+        curl https://raw.githubusercontent.com/killbill/killbill-avatax-plugin/master/src/main/resources/ddl.sql | mysql -h 127.0.0.1 -u root --password=root killbill
+        curl https://raw.githubusercontent.com/killbill/killbill-payment-test-plugin/master/src/main/resources/ddl.sql | mysql -h 127.0.0.1 -u root --password=root killbill
+        curl https://raw.githubusercontent.com/killbill/killbill-email-notifications-plugin/master/src/main/resources/ddl.sql | mysql -h 127.0.0.1 -u root --password=root killbill
+    - run: touch optcd-12.txt
+    - name: Install plugin specific PostgreSQL DDL
+      run: |-
+        curl https://raw.githubusercontent.com/killbill/killbill-avatax-plugin/master/src/main/resources/ddl.sql | psql -h 127.0.0.1 -U postgres -p 5432 -d killbill
+        curl https://raw.githubusercontent.com/killbill/killbill-payment-test-plugin/master/src/main/resources/ddl.sql | psql -h 127.0.0.1 -U postgres -p 5432 -d killbill
+        curl https://raw.githubusercontent.com/killbill/killbill-email-notifications-plugin/master/src/main/resources/ddl.sql | psql -h 127.0.0.1 -U postgres -p 5432 -d killbill
+    - run: touch optcd-13.txt
+    - name: Start Kill Bill
+      timeout-minutes: 4
+      run: |-
+        mkdir -p /tmp/test-results
+        nohup ./bin/start-server -s > /tmp/test-results/killbill.log 2>&1 &
+        count=0
+        until $(curl --connect-timeout 10 --max-time 30 --output /dev/null --silent --fail http://127.0.0.1:8080/1.0/healthcheck); do
+          if [[ "$count" == "180" ]]; then
+            exit 64
+          fi
+          count=$(( count + 1 ))
+          sleep 1
+        done
+        curl --connect-timeout 10 --max-time 30 -v \
+             -X POST \
+             -u admin:password \
+             -H 'Content-Type: application/json' \
+             -H 'X-Killbill-CreatedBy: GitHub' \
+             -d '{"apiKey": "bob", "apiSecret": "lazar"}' \
+             "http://127.0.0.1:8080/1.0/kb/tenants"
+    - run: touch optcd-14.txt
+    - name: Checkout killbill-integration-tests
+      uses: actions/checkout@v2
+      with:
+        persist-credentials: false
+        path: killbill-integration-tests
+        repository: killbill/killbill-integration-tests
+        ref: ${{ matrix.ref }}
+    - run: touch optcd-15.txt
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ matrix.ruby-version }}
+        working-directory: ${{github.workspace}}/killbill-integration-tests
+        bundler-cache: true
+    - run: touch optcd-16.txt
+    - name: Install dependencies
+      working-directory: ${{github.workspace}}/killbill-integration-tests
+      run: |-
+        bundle install --jobs=4 --retry=3
+    - run: touch optcd-17.txt
+    - name: Run core tests
+      env:
+        DB_ADAPTER: ${{ matrix.database-adapter }}
+        DB_USER: ${{ matrix.database-user }}
+        DB_PASSWORD: ${{ matrix.database-password }}
+        DB_PORT: ${{ matrix.database-port }}
+      working-directory: ${{github.workspace}}/killbill-integration-tests
+      run: |-
+        bundle exec rake test:core TESTOPTS="--stop-on-failure"
+    - run: touch optcd-18.txt
+    - name: Upload artifact on failure
+      uses: actions/upload-artifact@v2.3.1
+      with:
+        name: failure-${{ matrix.database }}
+        path: /tmp/test-results/killbill.log
+    - run: touch optcd-19.txt
+    - name: Upload inotifywait logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: inotifywait-e2e ()
+        path: /home/runner/inotifywait-log-e2e ().csv
+    name: e2e ()
+'on':
+- push
+- workflow_dispatch
